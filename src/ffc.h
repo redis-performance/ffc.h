@@ -289,6 +289,33 @@ bool ffc_clinger_fast_path_impl(uint64_t mantissa, int64_t exponent, bool is_neg
   return false;
 }
 
+// GCC-only optimization. Slow disambiguation kept OUT of the force-inlined
+// from_chars hot frame (mirrors fast_float's parse_number_slow_path): the
+// too_many_digits recompute (a 2nd compute_float + compute_error) and the
+// power2<0 big-integer comparison are both rare (proven by Mushtak & Lemire,
+// arXiv:2212.06644), so inlining their bytes only bloats the hot frame. The
+// noinline forces GCC -O3 IPA not to re-inline this single static caller;
+// shrinks ffc_from_chars_double ~21% and is worth +3-15% on GCC. Gated to GCC:
+// Clang (esp. AArch64) inlines differently and the outline regressed it, so
+// Clang/MSVC keep the original inline form below (byte-identical to baseline).
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline))
+ffc_internal
+ffc_adjusted_mantissa ffc_resolve_slow(ffc_parsed const pns, ffc_adjusted_mantissa am, ffc_value_kind vk) {
+  if (pns.too_many_digits && am.power2 >= 0) {
+    ffc_adjusted_mantissa am_plus_one = ffc_compute_float(pns.exponent, pns.mantissa + 1, vk);
+    bool equal = am.mantissa == am_plus_one.mantissa && am.power2 == am_plus_one.power2;
+    if (!equal) {
+      am = ffc_compute_error(pns.exponent, pns.mantissa, vk);
+    }
+  }
+  if (am.power2 < 0) {
+    am = ffc_digit_comp(pns, am, vk);
+  }
+  return am;
+}
+#endif
+
 ffc_internal ffc_inline
 ffc_result ffc_from_chars_advanced(ffc_parsed const pns, ffc_value* value, ffc_value_kind vk) {
   ffc_result answer;
@@ -305,6 +332,16 @@ ffc_result ffc_from_chars_advanced(ffc_parsed const pns, ffc_value* value, ffc_v
   ffc_adjusted_mantissa am = ffc_compute_float(pns.exponent, pns.mantissa, vk);
   ffc_debug("am.mantissa: %llu\n", am.mantissa);
   ffc_debug("am.power2:   %d\n", am.power2);
+  // Rare disambiguation (too_many_digits recompute, or invalid power2<0 ->
+  // big-integer compare). On GCC it lives out-of-line in ffc_resolve_slow so
+  // its bytes stay out of this force-inlined hot frame; Clang/MSVC use the
+  // original inline form (their inliners do better with it). Identical results
+  // either way -- the common case skips it entirely. This is very uncommon.
+#if defined(__GNUC__) && !defined(__clang__)
+  if (pns.too_many_digits || am.power2 < 0) {
+    am = ffc_resolve_slow(pns, am, vk);
+  }
+#else
   if (pns.too_many_digits && am.power2 >= 0) {
     ffc_adjusted_mantissa am_plus_one = ffc_compute_float(pns.exponent, pns.mantissa + 1, vk);
     bool equal = am.mantissa == am_plus_one.mantissa && am.power2 == am_plus_one.power2;
@@ -312,12 +349,10 @@ ffc_result ffc_from_chars_advanced(ffc_parsed const pns, ffc_value* value, ffc_v
       am = ffc_compute_error(pns.exponent, pns.mantissa, vk);
     }
   }
-  // If we called ffc_compute_float(pns.exponent, pns.mantissa)
-  // and we have an invalid power (am.power2 < 0), then we need to go the long
-  // way around again. This is very uncommon.
   if (am.power2 < 0) {
     am = ffc_digit_comp(pns, am, vk);
   }
+#endif
   ffc_debug("am post mantissa: %llu\n", am.mantissa);
   ffc_debug("am post power2:   %d\n", am.power2);
   ffc_am_to_float(pns.negative, am, value, vk);
